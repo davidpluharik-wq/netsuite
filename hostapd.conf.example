@@ -1,0 +1,8 @@
+# Copy to hostapd.conf and match HONEYPOT_INTERFACE. Requires AP support.
+interface=wlan0
+driver=nl80211
+ssid=Lab-Honeypot
+hw_mode=g
+channel=6
+# Set your local regulatory country before use.
+# country_code=CZ

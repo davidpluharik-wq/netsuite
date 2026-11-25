@@ -39,10 +39,12 @@ import tempfile
 import threading
 import time
 import tkinter as tk
+from skull_art import add_skull
 from tkinter import ttk, messagebox, filedialog
 from tkinter import font as tkfont
 from datetime import datetime
 from pathlib import Path
+from collections import defaultdict, deque
 import xml.etree.ElementTree as ET
 
 
@@ -2843,7 +2845,475 @@ REQUIRED_TOOLS = [
     ("arpspoof", "ARP/MITM", "arpspoof", "dsniff"),
     ("tcpdump", "ARP/MITM (capture)", "tcpdump", "tcpdump"),
     ("nikto", "Web Scanner", "nikto", "nikto"),
+    ("hostapd", "WiFi honeypot", "hostapd", "hostapd"),
+    ("dnsmasq", "WiFi honeypot", "dnsmasq", "dnsmasq"),
 ]
+
+# ===========================================================================
+# Intrusion watch — passive SSH brute-force detection (auth log tailer)
+# Ported from the standalone brute-force-detector app.
+# ===========================================================================
+AUTH_LOG_PATHS = ["/var/log/auth.log", "/var/log/secure"]
+AUTH_FAILED_RE = re.compile(r"Failed password for (?:invalid user )?(\S+) from (\S+) port (\d+)")
+AUTH_INVALID_RE = re.compile(r"Invalid user (\S+) from (\S+) port (\d+)")
+AUTH_ACCEPTED_RE = re.compile(r"Accepted password for (\S+) from (\S+) port (\d+)")
+
+
+def find_auth_log():
+    for path in AUTH_LOG_PATHS:
+        if Path(path).exists():
+            return path
+    return None
+
+
+class AuthLogTailThread(threading.Thread):
+    """Tails the auth log, counts failed logins per IP in a sliding window, flags bursts."""
+
+    def __init__(self, log_path, event_queue, window_seconds, threshold):
+        super().__init__(daemon=True)
+        self.log_path = log_path
+        self.event_queue = event_queue
+        self.window_seconds = window_seconds
+        self.threshold = threshold
+        self._stop = threading.Event()
+        self.attempts = defaultdict(deque)
+        self.usernames = defaultdict(set)
+        self.flagged = set()
+
+    def stop(self):
+        self._stop.set()
+
+    def run(self):
+        try:
+            f = open(self.log_path, "r")
+        except PermissionError:
+            self.event_queue.put(("error", f"Permission denied reading {self.log_path}. "
+                                           "Run NetSuite with sudo, or add your user to the 'adm' group."))
+            return
+        except FileNotFoundError:
+            self.event_queue.put(("error", f"Log file not found: {self.log_path}"))
+            return
+        f.seek(0, os.SEEK_END)  # only watch new lines
+        inode = os.fstat(f.fileno()).st_ino
+        self.event_queue.put(("status", f"Watching {self.log_path} ..."))
+        while not self._stop.is_set():
+            line = f.readline()
+            if line:
+                self._process_line(line)
+                continue
+            try:
+                if os.stat(self.log_path).st_ino != inode:  # handle log rotation
+                    f.close()
+                    f = open(self.log_path, "r")
+                    inode = os.fstat(f.fileno()).st_ino
+                    self.event_queue.put(("status", "Log file rotated — reopened."))
+            except FileNotFoundError:
+                pass
+            self._stop.wait(0.5)
+        f.close()
+
+    def _process_line(self, line):
+        now = time.time()
+        m = AUTH_FAILED_RE.search(line) or AUTH_INVALID_RE.search(line)
+        if m:
+            username, ip = m.group(1), m.group(2)
+            self._prune(ip, now)
+            self.attempts[ip].append(now)
+            self.usernames[ip].add(username)
+            count = len(self.attempts[ip])
+            self.event_queue.put(("failed_attempt", {"ip": ip, "username": username, "count": count}))
+            if count >= self.threshold and ip not in self.flagged:
+                self.flagged.add(ip)
+                self.event_queue.put(("brute_force", {"ip": ip, "count": count,
+                                                      "usernames": set(self.usernames[ip])}))
+            return
+        m = AUTH_ACCEPTED_RE.search(line)
+        if m:
+            self.event_queue.put(("accepted", {"ip": m.group(2), "username": m.group(1)}))
+
+    def _prune(self, ip, now):
+        dq = self.attempts[ip]
+        while dq and now - dq[0] > self.window_seconds:
+            dq.popleft()
+        if not dq:
+            self.flagged.discard(ip)
+            self.usernames[ip].clear()
+
+
+class IntrusionWatchTab:
+    def __init__(self, parent):
+        self.frame = ttk.Frame(parent, padding=10)
+        self.event_queue = queue.Queue()
+        self.thread = None
+        self.ip_data = {}
+        self.ip_rows = {}
+        self._build_ui()
+        self._poll_queue()
+
+    def _build_ui(self):
+        ttk.Label(self.frame, foreground=MUTED,
+                  text="Passively watches your SSH auth log and flags any source IP that fails too many "
+                       "logins inside the time window. Nothing is blocked automatically.").pack(anchor="w", pady=(0, 8))
+
+        controls = ttk.Frame(self.frame)
+        controls.pack(fill="x")
+        log_path = find_auth_log()
+        ttk.Label(controls, text=f"Log file: {log_path or 'NOT FOUND'}").grid(row=0, column=0, columnspan=4, sticky="w")
+        ttk.Label(controls, text="Window (sec):").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        self.window_entry = ttk.Entry(controls, width=8)
+        self.window_entry.insert(0, "60")
+        self.window_entry.grid(row=1, column=1, sticky="w", pady=(8, 0), padx=(5, 20))
+        ttk.Label(controls, text="Threshold (attempts):").grid(row=1, column=2, sticky="w", pady=(8, 0))
+        self.threshold_entry = ttk.Entry(controls, width=8)
+        self.threshold_entry.insert(0, "5")
+        self.threshold_entry.grid(row=1, column=3, sticky="w", pady=(8, 0), padx=(5, 20))
+        self.start_button = ttk.Button(controls, text="Start Watching", command=self.start)
+        self.start_button.grid(row=1, column=4, padx=5, pady=(8, 0))
+        self.stop_button = ttk.Button(controls, text="Stop", command=self.stop, state="disabled")
+        self.stop_button.grid(row=1, column=5, padx=5, pady=(8, 0))
+        self.block_button = ttk.Button(controls, text="Block Selected IP", command=self.block_selected_ip, state="disabled")
+        self.block_button.grid(row=1, column=6, padx=5, pady=(8, 0))
+
+        self.status_label = ttk.Label(self.frame, text="Idle.")
+        self.status_label.pack(anchor="w", pady=(8, 0))
+        if not IS_ROOT:
+            ttk.Label(self.frame, foreground=MEDIUM,
+                      text="⚠ Not running as root — blocking IPs won't work, and reading the log may fail "
+                           "unless your user is in the 'adm' group.").pack(anchor="w")
+
+        table_frame = ttk.Frame(self.frame)
+        table_frame.pack(fill="both", expand=True, pady=(10, 0))
+        columns = ("ip", "count", "usernames", "first_seen", "last_seen", "status")
+        self.tree = ttk.Treeview(table_frame, columns=columns, show="headings", height=12)
+        for col, label, width in [("ip", "Source IP", 140), ("count", "Attempts (window)", 130),
+                                   ("usernames", "Usernames Tried", 220), ("first_seen", "First Seen", 100),
+                                   ("last_seen", "Last Seen", 100), ("status", "Status", 150)]:
+            self.tree.heading(col, text=label)
+            self.tree.column(col, width=width, anchor="w")
+        self.tree.tag_configure("flagged", background="#392832", foreground=WARN)
+        self.tree.bind("<<TreeviewSelect>>", self._on_select)
+        scrollbar = ttk.Scrollbar(table_frame, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=scrollbar.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        ttk.Label(self.frame, text="Activity Log:").pack(anchor="w", pady=(10, 0))
+        self.log_text = tk.Text(self.frame, height=6, state="disabled", wrap="word", bg="#111c2a", fg=TEXT_COLOR)
+        self.log_text.pack(fill="both", expand=False)
+
+    def start(self):
+        log_path = find_auth_log()
+        if not log_path:
+            messagebox.showerror("Log not found", f"Couldn't find any of: {', '.join(AUTH_LOG_PATHS)}")
+            return
+        try:
+            window_seconds = int(self.window_entry.get().strip())
+            threshold = int(self.threshold_entry.get().strip())
+        except ValueError:
+            messagebox.showerror("Invalid input", "Window and threshold must be whole numbers.")
+            return
+        self.thread = AuthLogTailThread(log_path, self.event_queue, window_seconds, threshold)
+        self.thread.start()
+        self.start_button.config(state="disabled")
+        self.stop_button.config(state="normal")
+        self.window_entry.config(state="disabled")
+        self.threshold_entry.config(state="disabled")
+        self._log(f"Started watching {log_path} (window={window_seconds}s, threshold={threshold}).")
+
+    def stop(self):
+        if self.thread:
+            self.thread.stop()
+            self.thread = None
+        self.start_button.config(state="normal")
+        self.stop_button.config(state="disabled")
+        self.window_entry.config(state="normal")
+        self.threshold_entry.config(state="normal")
+        self.status_label.config(text="Stopped.")
+        self._log("Stopped watching.")
+
+    def block_selected_ip(self):
+        selection = self.tree.selection()
+        if not selection:
+            return
+        ip = self.tree.item(selection[0], "values")[0]
+        if not IS_ROOT:
+            messagebox.showerror("Root required", "Blocking IPs requires root. Restart NetSuite with sudo.")
+            return
+        if not messagebox.askyesno("Confirm block",
+                                   f"Add a firewall rule to drop all traffic from {ip}?\n\n"
+                                   f"This runs: iptables -A INPUT -s {ip} -j DROP"):
+            return
+        try:
+            result = subprocess.run(["iptables", "-A", "INPUT", "-s", ip, "-j", "DROP"],
+                                    capture_output=True, text=True, timeout=10)
+            if result.returncode == 0:
+                self._log(f"Blocked {ip} via iptables.")
+                messagebox.showinfo("Blocked", f"{ip} has been blocked.")
+                if ip in self.ip_data:
+                    self.ip_data[ip]["status"] = "BLOCKED"
+                    self._refresh_row(ip)
+            else:
+                messagebox.showerror("iptables error", result.stderr.strip() or "Unknown error")
+        except FileNotFoundError:
+            messagebox.showerror("iptables not found", "iptables is not installed or not in PATH.")
+        except (OSError, subprocess.SubprocessError) as error:
+            messagebox.showerror("Error", str(error))
+
+    def _on_select(self, event):
+        self.block_button.config(state="normal" if self.tree.selection() else "disabled")
+
+    def _poll_queue(self):
+        try:
+            while True:
+                kind, payload = self.event_queue.get_nowait()
+                if kind == "status":
+                    self.status_label.config(text=payload)
+                    self._log(payload)
+                elif kind == "error":
+                    self.status_label.config(text=f"Error: {payload}", foreground=WARN)
+                    self._log(f"ERROR: {payload}")
+                    messagebox.showerror("Error", payload)
+                elif kind == "failed_attempt":
+                    self._handle_failed(payload)
+                elif kind == "brute_force":
+                    self._handle_brute_force(payload)
+                elif kind == "accepted":
+                    self._log(f"Successful login: {payload['username']} from {payload['ip']}")
+        except queue.Empty:
+            pass
+        self.frame.after(300, self._poll_queue)
+
+    def _handle_failed(self, payload):
+        ip = payload["ip"]
+        now_str = datetime.now().strftime("%H:%M:%S")
+        data = self.ip_data.get(ip)
+        if data is None:
+            self.ip_data[ip] = {"count": payload["count"], "usernames": {payload["username"]},
+                                "first_seen": now_str, "last_seen": now_str, "status": "Watching"}
+        else:
+            data["count"] = payload["count"]
+            data["usernames"].add(payload["username"])
+            data["last_seen"] = now_str
+        self._refresh_row(ip)
+        self._log(f"Failed login: user='{payload['username']}' from {ip} (attempt #{payload['count']} in window)")
+
+    def _handle_brute_force(self, payload):
+        ip = payload["ip"]
+        if ip in self.ip_data:
+            self.ip_data[ip]["status"] = "⚠ BRUTE FORCE"
+            self._refresh_row(ip)
+        self._log(f"⚠ BRUTE FORCE DETECTED from {ip} — {payload['count']} failed attempts, "
+                  f"usernames tried: {', '.join(sorted(payload['usernames']))}")
+        log_to_file(f"[IntrusionWatch] BRUTE FORCE from {ip} — {payload['count']} failed attempts")
+        notify_desktop("Brute-force attack detected!", f"{ip} — {payload['count']} failed SSH attempts")
+
+    def _refresh_row(self, ip):
+        data = self.ip_data[ip]
+        values = (ip, data["count"], ", ".join(sorted(data["usernames"])),
+                  data["first_seen"], data["last_seen"], data["status"])
+        tags = ("flagged",) if data["status"] != "Watching" else ()
+        if ip in self.ip_rows:
+            self.tree.item(self.ip_rows[ip], values=values, tags=tags)
+        else:
+            self.ip_rows[ip] = self.tree.insert("", "end", values=values, tags=tags)
+
+    def _log(self, message):
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        self.log_text.config(state="normal")
+        self.log_text.insert("end", f"[{timestamp}] {message}\n")
+        self.log_text.see("end")
+        self.log_text.config(state="disabled")
+
+
+# ===========================================================================
+# WiFi honeypot — dedicated lab AP (hostapd + dnsmasq) with DHCP logging
+# Ported from the standalone wifi-honeypot app (live table only, no SQLite).
+# ===========================================================================
+HONEYPOT_INTERFACE = os.environ.get("HONEYPOT_INTERFACE", "wlan0")
+HONEYPOT_AP_IP = os.environ.get("HONEYPOT_IP", "192.168.50.1/24")
+HONEYPOT_HOSTAPD_CONF = os.environ.get("HONEYPOT_HOSTAPD_CONF", str(Path(__file__).with_name("hostapd.conf")))
+HONEYPOT_DNSMASQ_CONF = os.environ.get("HONEYPOT_DNSMASQ_CONF", str(Path(__file__).with_name("dnsmasq.conf")))
+HONEYPOT_DHCP_RE = re.compile(
+    r"DHCP(DISCOVER|OFFER|REQUEST|ACK|NAK)\((?P<iface>[^)]+)\)\s+"
+    r"(?:(?P<ip>\d{1,3}(?:\.\d{1,3}){3})\s+)?"
+    r"(?P<mac>[0-9a-fA-F:]{17})?"
+    r"(?:\s+(?P<hostname>\S+))?")
+
+
+class HoneypotTab:
+    def __init__(self, parent):
+        self.frame = ttk.Frame(parent, padding=10)
+        self.event_queue = queue.Queue()
+        self.dnsmasq_proc = None
+        self.hostapd_proc = None
+        self.address_added = False
+        self.startup_thread = None
+        self.reader_thread = None
+        self.stop_flag = threading.Event()
+        self._build_ui()
+        self._poll_queue()
+
+    def _build_ui(self):
+        ttk.Label(self.frame, foreground=MUTED,
+                  text=f"Runs a dedicated lab access point on {HONEYPOT_INTERFACE} (hostapd + dnsmasq) and logs every "
+                       "device that joins. Needs root and a spare AP-capable adapter. Only for your own lab.").pack(
+            anchor="w", pady=(0, 8))
+
+        controls = ttk.Frame(self.frame)
+        controls.pack(fill="x")
+        self.start_button = ttk.Button(controls, text="Start Honeypot", command=self.start_honeypot)
+        self.start_button.pack(side="left", padx=(0, 8))
+        self.stop_button = ttk.Button(controls, text="Stop", command=self.stop_honeypot, state="disabled")
+        self.stop_button.pack(side="left", padx=(0, 8))
+        self.status_label = ttk.Label(controls, text="Status: idle")
+        self.status_label.pack(side="left", padx=12)
+        ttk.Button(controls, text="Clear Table", command=self.clear_table).pack(side="right")
+
+        table_frame = ttk.Frame(self.frame)
+        table_frame.pack(fill="both", expand=True, pady=(10, 0))
+        columns = ("time", "event", "ip", "mac", "hostname", "detail")
+        self.tree = ttk.Treeview(table_frame, columns=columns, show="headings", height=12)
+        headings = {"time": "Time", "event": "Event", "ip": "IP", "mac": "MAC", "hostname": "Hostname", "detail": "Detail"}
+        widths = {"time": 90, "event": 110, "ip": 120, "mac": 140, "hostname": 160, "detail": 260}
+        for col in columns:
+            self.tree.heading(col, text=headings[col])
+            self.tree.column(col, width=widths[col], anchor="w")
+        scrollbar = ttk.Scrollbar(table_frame, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=scrollbar.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        ttk.Label(self.frame, text="Raw log:").pack(anchor="w", pady=(10, 0))
+        self.log_text = tk.Text(self.frame, height=7, state="disabled", wrap="word", bg="#111c2a", fg=GOOD)
+        self.log_text.pack(fill="both", expand=False)
+
+    def _set_status(self, text, color=MUTED):
+        self.status_label.config(text=f"Status: {text}", foreground=color)
+
+    def start_honeypot(self):
+        if not IS_ROOT:
+            messagebox.showerror("Permission needed",
+                                 "The honeypot must run as root (it starts hostapd/dnsmasq).\n"
+                                 "Restart NetSuite with: sudo -E python3 netsuite.py")
+            return
+        for config in (HONEYPOT_HOSTAPD_CONF, HONEYPOT_DNSMASQ_CONF):
+            if not Path(config).is_file():
+                messagebox.showerror("Configuration needed",
+                                     f"Missing {config}.\nCopy hostapd.conf.example / dnsmasq.conf.example to "
+                                     "hostapd.conf / dnsmasq.conf and edit them. See README.md.")
+                return
+        for command in ("hostapd", "dnsmasq", "ip"):
+            if not shutil.which(command):
+                messagebox.showerror("Missing dependency", f"Install {command} first; see README.md.")
+                return
+        self.stop_flag.clear()
+        self.start_button.config(state="disabled")
+        self._set_status("starting…", MEDIUM)
+        self._log("=== Starting honeypot sequence ===")
+        self.startup_thread = threading.Thread(target=self._startup_sequence, daemon=True)
+        self.startup_thread.start()
+
+    def _startup_sequence(self):
+        try:
+            # Dedicated, already-configured AP interface. Never stop global networking
+            # services or terminate processes owned by other apps.
+            subprocess.run(["ip", "link", "set", HONEYPOT_INTERFACE, "up"],
+                           check=True, capture_output=True, text=True, timeout=15)
+            addresses = subprocess.run(["ip", "-o", "addr", "show", "dev", HONEYPOT_INTERFACE],
+                                       check=True, capture_output=True, text=True, timeout=15)
+            if HONEYPOT_AP_IP not in addresses.stdout.split():
+                subprocess.run(["ip", "addr", "add", HONEYPOT_AP_IP, "dev", HONEYPOT_INTERFACE],
+                               check=True, capture_output=True, text=True, timeout=15)
+                self.address_added = True
+            self.hostapd_proc = subprocess.Popen(["hostapd", HONEYPOT_HOSTAPD_CONF],
+                                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if self.stop_flag.wait(1) or self.hostapd_proc.poll() is not None:
+                raise RuntimeError("hostapd stopped; check config and AP support on the dedicated adapter")
+            self.dnsmasq_proc = subprocess.Popen(["dnsmasq", "-C", HONEYPOT_DNSMASQ_CONF, "-d", "--log-queries"],
+                                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+            if self.stop_flag.wait(0.5) or self.dnsmasq_proc.poll() is not None:
+                raise RuntimeError("dnsmasq stopped; check config, address, and port conflicts")
+            self.event_queue.put(("status_running", None))
+            self.reader_thread = threading.Thread(target=self._read_dnsmasq_output, daemon=True)
+            self.reader_thread.start()
+        except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+            self._cleanup()
+            self.event_queue.put(("status_error", str(error)))
+
+    def _read_dnsmasq_output(self):
+        if not self.dnsmasq_proc:
+            return
+        for line in self.dnsmasq_proc.stdout:
+            if self.stop_flag.is_set():
+                break
+            line = line.strip()
+            if not line:
+                continue
+            self.event_queue.put(("raw", line))
+            match = HONEYPOT_DHCP_RE.search(line)
+            if match:
+                self.event_queue.put(("record", (datetime.now().strftime("%H:%M:%S"), "DHCP-" + match.group(1),
+                                                 match.group("ip") or "", match.group("mac") or "",
+                                                 match.group("hostname") or "", "")))
+            # DNS queries stay in the raw log only; the table shows device connections (DHCP).
+
+    def _poll_queue(self):
+        try:
+            while True:
+                kind, payload = self.event_queue.get_nowait()
+                if kind == "record":
+                    self.tree.insert("", 0, values=payload)
+                elif kind == "raw":
+                    self._log(payload)
+                elif kind == "status_running":
+                    self._set_status("running — waiting for connections", GOOD)
+                    self.stop_button.config(state="normal")
+                elif kind == "status_error":
+                    self._set_status(payload, WARN)
+                    self.start_button.config(state="normal")
+        except queue.Empty:
+            pass
+        self.frame.after(150, self._poll_queue)
+
+    def clear_table(self):
+        self.tree.delete(*self.tree.get_children())
+
+    def _cleanup(self):
+        self.stop_flag.set()
+        for process in (self.dnsmasq_proc, self.hostapd_proc):
+            if process is not None:
+                try:
+                    process.terminate()
+                    process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+                if process.stdout:
+                    process.stdout.close()
+        self.dnsmasq_proc = self.hostapd_proc = None
+        if self.address_added:
+            try:
+                subprocess.run(["ip", "addr", "del", HONEYPOT_AP_IP, "dev", HONEYPOT_INTERFACE],
+                               check=True, capture_output=True, text=True, timeout=15)
+                self.address_added = False
+            except (OSError, subprocess.SubprocessError) as error:
+                self.event_queue.put(("raw", f"Could not remove AP address: {error}"))
+
+    def stop_honeypot(self):
+        self._cleanup()
+        if self.reader_thread:
+            self.reader_thread.join(timeout=3)
+        self._set_status("stopped")
+        self.start_button.config(state="normal")
+        self.stop_button.config(state="disabled")
+        self._log("Stopped owned AP processes and removed the address added by this app.")
+
+    def _log(self, message):
+        self.log_text.config(state="normal")
+        self.log_text.insert("end", message + "\n")
+        self.log_text.see("end")
+        self.log_text.config(state="disabled")
+
 
 class HomeTab:
     def __init__(self, parent, app):
@@ -3003,6 +3473,8 @@ class NetSuiteApp:
         self.exploit_tab = ExploitSearchTab(notebook)
         self.arpspoof_tab = ArpSpoofTab(notebook)
         self.nikto_tab = NiktoTab(notebook)
+        self.intrusion_tab = IntrusionWatchTab(notebook)
+        self.honeypot_tab = HoneypotTab(notebook)
         self.home_tab = HomeTab(notebook, self)
         self.pages = [
             ("overview", "Overview", "Your network, devices and local tools at a glance.", self.home_tab, "WORKSPACE"),
@@ -3018,6 +3490,8 @@ class NetSuiteApp:
             ("research", "Vulnerability lookup", "Search the local exploit database by service or version.", self.exploit_tab, None),
             ("arp", "ARP workspace", "Interface controls and packet capture for your lab.", self.arpspoof_tab, None),
             ("web", "Web checks", "Inspect your web services for common configuration issues.", self.nikto_tab, None),
+            ("intrusion", "Intrusion watch", "Watch auth logs for brute-force login bursts.", self.intrusion_tab, None),
+            ("honeypot", "WiFi honeypot", "Run a dedicated lab AP and log every device that joins.", self.honeypot_tab, None),
         ]
         self.nav_buttons = {}
         for key, title, description, tab, section in self.pages:
@@ -3092,11 +3566,10 @@ class NetSuiteApp:
         style.configure("Vertical.TScrollbar", background=BORDER, troughcolor=BG_COLOR, borderwidth=0, arrowcolor=MUTED)
 
     def _build_header(self):
-        header = tk.Frame(self.root, bg=PANEL_BG, height=72)
+        header = tk.Frame(self.root, bg=PANEL_BG, height=96)
         header.pack(fill="x")
         header.pack_propagate(False)
-        tk.Label(header, text="N", bg=SELECTED_BG, fg=ACCENT, font=(UI_FONT, 17, "bold"),
-                 padx=12, pady=4).pack(side="left", padx=(20, 12), pady=16)
+        add_skull(header, PANEL_BG, side="left", padx=(18, 12), pady=8)  # the skull is the logo
         tk.Label(header, text="NetSuite", bg=PANEL_BG, fg=TEXT_COLOR,
                  font=(UI_FONT, 17, "bold")).pack(side="left")
         tk.Label(header, text="PERSONAL NETWORK", bg=PANEL_BG, fg=MUTED,
@@ -3171,6 +3644,9 @@ class NetSuiteApp:
             self.arpspoof_tab.stop_mitm()
         if self.nikto_tab.thread:
             self.nikto_tab.thread.stop()
+        if self.intrusion_tab.thread:
+            self.intrusion_tab.thread.stop()
+        self.honeypot_tab._cleanup()
 
 
 def main():

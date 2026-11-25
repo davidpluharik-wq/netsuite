@@ -76,6 +76,15 @@ have additional prerequisites. Packet capture and firewall changes require
 root. State stays in `~/.netsuite_*.json` and `~/netsuite.log`. Optional Scapy
 failures disable capture without preventing other tabs from loading.
 
+**Intrusion watch** tails `/var/log/auth.log` (or `/var/log/secure`) for
+brute-force SSH bursts; reading it needs the `adm` group or root, and the
+optional Block button needs root and `iptables`. **WiFi honeypot** runs a
+dedicated lab AP and needs root, `hostapd`, `dnsmasq`, and a spare AP-capable
+adapter. Copy `hostapd.conf.example` and `dnsmasq.conf.example` to
+`hostapd.conf` / `dnsmasq.conf` and edit them first (both live configs are
+git-ignored). Override the adapter and AP address with the `HONEYPOT_INTERFACE`
+and `HONEYPOT_IP` environment variables.
+
 ## Troubleshooting
 
 - Missing Python module: install `requirements.txt` into `.venv` if provided.

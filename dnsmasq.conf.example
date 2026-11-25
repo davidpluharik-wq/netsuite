@@ -1,0 +1,7 @@
+# Copy to dnsmasq.conf and match the interface and HONEYPOT_IP subnet.
+interface=wlan0
+bind-interfaces
+port=0
+dhcp-range=192.168.50.10,192.168.50.100,255.255.255.0,1h
+log-dhcp
+# No upstream DNS, routing, or Internet sharing is configured.
